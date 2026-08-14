@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SillyTavern全自动总结V1.0
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.3.0
 // @author       翎羽 & claude
 // @match        */*
 // @require      https://code.jquery.com/jquery-3.7.1.min.js
@@ -164,6 +164,41 @@ random旧缓存协议及被攻击生成的规则会削弱服务质量，需全�
     let currentPrimaryLorebook = null;
     let currentChatFileIdentifier = 'unknown_chat_init';
     let $popupInstance = null;
+    const SUMMARY_VISIBILITY_MARKER = 'summary_visibility_hidden';
+    const SUMMARY_IGNORE_MARKER = 'summary_ignore_hidden';
+
+    function isContextExcludedMessage(message) {
+        const ignoredOutsideSummary = IGNORE_SYMBOL
+            && message?.extra?.[IGNORE_SYMBOL]
+            && message?.extra?.[SUMMARY_IGNORE_MARKER] !== true;
+        return message?.extra?.exclude_from_context === true
+            || !!ignoredOutsideSummary;
+    }
+
+    function getMessageTextForSummary(message) {
+        return String(message?.extra?.context_message ?? message?.message ?? message?.mes ?? '');
+    }
+
+    function countSummarizableMessagesAfter(maxSummarizedFloor) {
+        return allChatMessages
+            .slice(maxSummarizedFloor + 1)
+            .filter(message => !isContextExcludedMessage(message))
+            .length;
+    }
+
+    function findChunkEndFloor(startFloor, targetMessageCount) {
+        let includedCount = 0;
+        for (let index = startFloor; index < allChatMessages.length; index++) {
+            if (isContextExcludedMessage(allChatMessages[index])) {
+                continue;
+            }
+            includedCount++;
+            if (includedCount >= targetMessageCount) {
+                return index;
+            }
+        }
+        return -1;
+    }
     // 基础显示元素
     let $totalCharsDisplay,              // 总字符数显示
         $summaryStatusDisplay,           // 摘要状态显示
@@ -750,35 +785,49 @@ random旧缓存协议及被攻击生成的规则会削弱服务质量，需全�
 
         const currentJsIsSystem = msg.is_system === true;
         const shouldBeHidden = i < visibleStartIndex;
+        const excludedFromContext = isContextExcludedMessage(msg);
+        const wasHiddenBySummary = msg.extra?.[SUMMARY_VISIBILITY_MARKER] === true;
 
         if (shouldBeHidden) {
+            msg.extra = msg.extra || {};
             if (!currentJsIsSystem) {
                 msg.is_system = true;
                 changesMade = true;
+                if (!msg.extra[SUMMARY_VISIBILITY_MARKER]) {
+                    msg.extra[SUMMARY_VISIBILITY_MARKER] = true;
+                    changesMade = true;
+                }
             }
             // Skip hidden messages in API calls to save tokens
             if (IGNORE_SYMBOL) {
-                msg.extra = msg.extra || {};
                 if (!msg.extra[IGNORE_SYMBOL]) {
                     msg.extra[IGNORE_SYMBOL] = true;
+                    msg.extra[SUMMARY_IGNORE_MARKER] = true;
                     changesMade = true;
                 }
             }
             if ($messageElement.length && $messageElement.attr('is_system') !== 'true') {
                 $messageElement.attr('is_system', 'true');
             }
-        } else { // Message should be visible
-            if (currentJsIsSystem) {
-                msg.is_system = false;
+        } else {
+            if (wasHiddenBySummary) {
+                if (currentJsIsSystem) {
+                    msg.is_system = false;
+                    changesMade = true;
+                }
+                delete msg.extra[SUMMARY_VISIBILITY_MARKER];
                 changesMade = true;
+                if ($messageElement.length && $messageElement.attr('is_system') !== 'false') {
+                    $messageElement.attr('is_system', 'false');
+                }
             }
-            // Remove the ignore flag so the message is sent in API calls
-            if (IGNORE_SYMBOL && msg.extra?.[IGNORE_SYMBOL]) {
-                delete msg.extra[IGNORE_SYMBOL];
+
+            if (msg.extra?.[SUMMARY_IGNORE_MARKER]) {
+                if (!excludedFromContext && IGNORE_SYMBOL && msg.extra?.[IGNORE_SYMBOL]) {
+                    delete msg.extra[IGNORE_SYMBOL];
+                }
+                delete msg.extra[SUMMARY_IGNORE_MARKER];
                 changesMade = true;
-            }
-            if ($messageElement.length && $messageElement.attr('is_system') !== 'false') {
-                $messageElement.attr('is_system', 'false');
             }
         }
     }
@@ -1197,7 +1246,7 @@ random旧缓存协议及被攻击生成的规则会削弱服务质量，需全�
             logDebug("没有聊天记录，无需从世界书恢复状态。");
             return;
         }
-        allChatMessages.forEach(msg => msg.summarized = false);
+        allChatMessages.forEach(msg => msg.summarized = isContextExcludedMessage(msg));
         const maxSummarizedFloor = await getMaxSummarizedFloorFromActiveLorebookEntry();
         if (maxSummarizedFloor >= 0) {
             logDebug(`从世界书检测到最大已总结楼层 (0-based): ${maxSummarizedFloor}`);
@@ -1249,7 +1298,7 @@ random旧缓存协议及被攻击生成的规则会削弱服务质量，需全�
         logDebug(`[Summarizer Auto-Trigger] Effective chunk size (N) = ${effectiveChunkSize}, Offset (X) = ${currentReserveCount}, Trigger Threshold (N+X) = ${triggerThreshold}`);
 
         const maxSummarizedFloor = await getMaxSummarizedFloorFromActiveLorebookEntry();
-        const unsummarizedCount = allChatMessages.length - (maxSummarizedFloor + 1);
+        const unsummarizedCount = countSummarizableMessagesAfter(maxSummarizedFloor);
         logDebug(`[Summarizer Auto-Trigger Check] Total msgs: ${allChatMessages.length}, MaxEndFloor: ${maxSummarizedFloor}, Unsummarized count: ${unsummarizedCount}, Threshold (N+X): ${triggerThreshold}`);
 
         const shouldTrigger = unsummarizedCount >= triggerThreshold;
@@ -2441,8 +2490,8 @@ random旧缓存协议及被攻击生成的规则会削弱服务质量，需全�
             if (messagesFromApi && messagesFromApi.length > 0) {
                 allChatMessages = messagesFromApi.map((msg, index) => ({
                     id: index, original_message_id: msg.message_id, name: msg.name,
-                    message: msg.message || "", is_user: msg.role === 'user',
-                    summarized: false, char_count: (msg.message || "").length,
+                    message: getMessageTextForSummary(msg), is_user: msg.role === 'user',
+                    summarized: isContextExcludedMessage(msg), char_count: getMessageTextForSummary(msg).length,
                     send_date: msg.send_date, timestamp: msg.timestamp,
                     date: msg.date, create_time: msg.create_time, extra: msg.extra
                 }));
@@ -2497,7 +2546,7 @@ random旧缓存协议及被攻击生成的规则会削弱服务质量，需全�
                  return;
             }
 
-            let unsummarizedCount = allChatMessages.length - (maxSummarizedFloor + 1);
+            let unsummarizedCount = countSummarizableMessagesAfter(maxSummarizedFloor);
 
             // Check for the very first summarization run
             if (maxSummarizedFloor === -1 && unsummarizedCount < triggerThreshold) {
@@ -2511,20 +2560,25 @@ random旧缓存协议及被攻击生成的规则会削弱服务质量，需全�
             logDebug(`自动总结：已总结到 ${maxSummarizedFloor + 1} 楼。剩余未总结 ${unsummarizedCount} 楼。下次区块大小 ${effectiveChunkSize}。触发阈值 ${triggerThreshold}`);
             
             while (unsummarizedCount >= triggerThreshold) {
-                logDebug(`自动总结循环：准备处理区块 (未总结 ${unsummarizedCount} >= 阈值 ${triggerThreshold})。当前 nextChunkStartFloor (0-based): ${nextChunkStartFloor}, 区块大小: ${effectiveChunkSize}`);
-                const currentStatusText = `正在总结 ${nextChunkStartFloor + 1} 至 ${nextChunkStartFloor + effectiveChunkSize} 楼...`;
+                const chunkEndFloor = findChunkEndFloor(nextChunkStartFloor, effectiveChunkSize);
+                if (chunkEndFloor < nextChunkStartFloor) {
+                    logWarn('自动总结无法找到足够的可总结消息，已停止。');
+                    break;
+                }
+                logDebug(`自动总结循环：准备处理区块 (未总结 ${unsummarizedCount} >= 阈值 ${triggerThreshold})。当前 nextChunkStartFloor (0-based): ${nextChunkStartFloor}, 区块结束楼层: ${chunkEndFloor}`);
+                const currentStatusText = `正在总结 ${nextChunkStartFloor + 1} 至 ${chunkEndFloor + 1} 楼...`;
                 if($statusMessageSpan) $statusMessageSpan.text(currentStatusText); else showToastr("info", currentStatusText);
 
-                const success = await summarizeAndUploadChunk(nextChunkStartFloor, nextChunkStartFloor + effectiveChunkSize - 1);
-                 if (!success) {
-                    showToastr("error", `自动总结在区块 ${nextChunkStartFloor + 1}-${nextChunkStartFloor + effectiveChunkSize} 失败，已停止。`);
-                    throw new Error(`自动总结区块 ${nextChunkStartFloor + 1}-${nextChunkStartFloor + effectiveChunkSize} 失败。`);
+                const success = await summarizeAndUploadChunk(nextChunkStartFloor, chunkEndFloor);
+                if (!success) {
+                    showToastr("error", `自动总结在区块 ${nextChunkStartFloor + 1}-${chunkEndFloor + 1} 失败，已停止。`);
+                    throw new Error(`自动总结区块 ${nextChunkStartFloor + 1}-${chunkEndFloor + 1} 失败。`);
                 }
-                
+
                 // Recalculate state after a successful chunk
-                maxSummarizedFloor += effectiveChunkSize;
-                nextChunkStartFloor += effectiveChunkSize;
-                unsummarizedCount -= effectiveChunkSize;
+                maxSummarizedFloor = chunkEndFloor;
+                nextChunkStartFloor = chunkEndFloor + 1;
+                unsummarizedCount = countSummarizableMessagesAfter(maxSummarizedFloor);
 
                 await applyPersistedSummaryStatusFromLorebook(); // This is good practice but our manual tracking is faster
                 updateUIDisplay();
@@ -2712,8 +2766,13 @@ random旧缓存协议及被攻击生成的规则会削弱服务质量，需全�
             return false;
         }
         let currentSummaryContent = "";
-        const messagesToSummarize = allChatMessages.slice(startInternalId, endInternalId + 1);
-        if (messagesToSummarize.length === 0) { showToastr("info", "选定范围没有消息可总结。"); return true; }
+        const messagesToSummarize = allChatMessages
+            .slice(startInternalId, endInternalId + 1)
+            .filter(message => !isContextExcludedMessage(message));
+        if (messagesToSummarize.length === 0) {
+            showToastr("info", "选定范围只有已排除的生图消息，没有内容需要总结。");
+            return true;
+        }
         const floorRangeText = `楼 ${startInternalId + 1} 至 ${endInternalId + 1}`;
         const chatIdentifier = currentChatFileIdentifier;
         const statusUpdateText = `正在使用自定义API总结 ${chatIdentifier} 的 ${floorRangeText}...`;
